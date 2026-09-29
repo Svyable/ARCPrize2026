@@ -14,6 +14,7 @@ The only thing read from the environment is: grid, state name, score, available 
 """
 from __future__ import annotations
 
+import heapq
 import logging
 import random
 import time
@@ -72,6 +73,10 @@ class ExplorerAgent:
         momentum: bool = True,
         novelty_rate: bool = True,
         max_seconds: float | None = None,
+        depth_weight: float = 1.0,
+        max_run: int = 6,
+        repeat_cost: float = 0.25,
+        greedy_budget: int = 250,
     ) -> None:
         self.rng = random.Random(seed)
         self.max_actions = max_actions
@@ -82,6 +87,10 @@ class ExplorerAgent:
         self.min_rate = min_rate
         self.momentum = momentum
         self.novelty_rate = novelty_rate
+        self.depth_weight = depth_weight
+        self.max_run = max_run
+        self.repeat_cost = repeat_cost
+        self.greedy_budget = greedy_budget
         self.deadline = None if max_seconds is None else time.monotonic() + max_seconds
         self.actions_taken = 0
         self.score = 0
@@ -146,7 +155,11 @@ class ExplorerAgent:
         self.raws: list[np.ndarray] = []
         self.raw_id: dict[bytes, int] = {}
         self.log: list[tuple[int, Action, int, int]] = []  # (src_raw, action, dst_raw | DEAD, life_len)
+        self.level_actions = 0  # actions spent on this level
+        self.run_len = 0  # consecutive repeats of last_act
         self.last_act: Action | None = None  # last action if it changed the state, else None
+        self._depth_key: tuple | None = None
+        self._depth_map: dict[int, float] = {}
         self.resets = 0  # RESETs issued this level
         self._restart_checked_life: tuple[int, int] | None = None
         self._restart_ok = False
@@ -173,6 +186,7 @@ class ExplorerAgent:
 
     def _emit(self, act: Action, reason: str) -> Move:
         self.actions_taken += 1
+        self.level_actions += 1
         aid, x, y = act
         if aid == RESET_ID:
             self.resets += 1
@@ -238,6 +252,7 @@ class ExplorerAgent:
             n_nodes = len(self.edges)
             st = self.stats.setdefault(self._kind(act, self.raws[src_raw]), [0, 0])
             st[1] += 1
+            self.run_len = self.run_len + 1 if (changed and act == self.last_act) else 1
             self.last_act = act if changed else None
             self.cur_raw = rid
             rebuilt = self._update_volatility(self.raws[src_raw], grid, act)
@@ -378,30 +393,101 @@ class ExplorerAgent:
     # ---- action selection -----------------------------------------------------
     def _select(self) -> Action:
         node = self.cur_node
-        best = self._best_untried(node) if self.untried[node] else None
-        if best is not None and self._promising(best, node):
-            if self._fits(1) or not self._restart_useful():
-                return self._commit(node, best)
-            return self._restart()
+        if (self.momentum and not self.plan and self.last_act is not None and self.run_len < self.max_run
+                and self.last_act in self.untried[node] and self._fits(1)):
+            return self._commit(node, self.last_act)  # keep repeating an action that keeps changing things
         if not self.plan:
-            self.plan = self._bfs(node, promising_only=True)
-        if not self.plan and best is not None:
-            return self._commit(node, best)  # nothing promising anywhere: probe here
-        if not self.plan:
-            self.plan = self._bfs(node, promising_only=False)
-        if self.plan and not self._fits(len(self.plan) + 1) and self._restart_useful():
-            return self._restart()
-        if self.plan:
-            act, expect = self.plan.popleft()
-            self.plan_expect = expect
-            return self._commit(node, act)
-        # Fully explored (or the rest is unreachable): restart the level, else poke randomly.
+            target, path = self._choose_frontier(node, promising_only=True)
+            if target is None:
+                target, path = self._choose_frontier(node, promising_only=False)
+            if target is None:
+                return self._fully_explored(node)
+            if target == node:
+                act = self._best_untried(node)
+                if self._fits(1) or not self._restart_useful():
+                    return self._commit(node, act)
+                return self._restart()
+            self.plan = path
+            if not self._fits_plan() and self._restart_useful():
+                return self._restart()
+        act, expect = self.plan.popleft()
+        self.plan_expect = expect
+        if act == _RESET:
+            return self._restart(keep_plan=True)
+        return self._commit(node, act)
+
+    def _fits_plan(self) -> bool:
+        if any(a == _RESET for a, _ in self.plan):
+            return True  # a RESET in the path refreshes the life
+        return self._fits(len(self.plan) + 1)
+
+    def _fully_explored(self, node: int) -> Action:
+        """Everything known is exhausted: restart the level, else poke randomly."""
         if node != self.start_node:
-            self.pending = None
-            self.cur_node = -1
-            return _RESET
+            return self._restart()
         known = list(self.edges[node]) or self._candidates(self.raws[self.cur_raw])
         return self._commit(node, self.rng.choice(known))
+
+    def _graph_version(self) -> int:
+        return len(self.log) * 1000003 + len(self.edges)
+
+    def _depths(self) -> dict[int, float]:
+        """Exploration depth of each known node from the level's start node. Changing action
+        costs 1, repeating the previous action costs `repeat_cost`: winning sequences are
+        made of runs of one action, so depth counts runs rather than raw steps."""
+        key = (self._graph_version(), self.start_node)
+        if self._depth_key != key:
+            self._depth_key = key
+            dist: dict[int, float] = {self.start_node: 0.0}
+            last: dict[int, Action | None] = {self.start_node: None}
+            heap = [(0.0, self.start_node)]
+            while heap:
+                d0, n = heapq.heappop(heap)
+                if d0 > dist.get(n, 1e18):
+                    continue
+                for a, d in self.edges[n].items():
+                    if d < 0 or d == n:
+                        continue
+                    nd = d0 + (self.repeat_cost if a == last[n] else 1.0)
+                    if nd < dist.get(d, 1e18):
+                        dist[d], last[d] = nd, a
+                        heapq.heappush(heap, (nd, d))
+            self._depth_map = dist
+        return self._depth_map
+
+    def _choose_frontier(self, start: int, promising_only: bool) -> tuple[int | None, deque]:
+        """Frontier node minimising walk-cost + depth_weight * depth-from-level-start.
+        Walking may use a virtual RESET edge (any node -> start node, cost 1)."""
+        dist = {start: 0}
+        parent: dict[int, tuple[int, Action]] = {}
+        q = deque([start])
+        can_reset = self.start_node >= 0
+        while q:
+            n = q.popleft()
+            nbrs = [(a, d) for a, d in self.edges[n].items() if d >= 0 and d != n]
+            if can_reset and n != self.start_node:
+                nbrs.append((_RESET, self.start_node))
+            for a, d in nbrs:
+                if d not in dist:
+                    dist[d] = dist[n] + 1
+                    parent[d] = (n, a)
+                    q.append(d)
+        w = 0.0 if self.level_actions < self.greedy_budget else self.depth_weight
+        depth = self._depths() if w else {}
+        best, best_key = None, None
+        for n, dn in dist.items():
+            if not self.untried[n] or (promising_only and not self._node_promising(n)):
+                continue
+            key = (dn + w * depth.get(n, dn), dn, n)
+            if best_key is None or key < best_key:
+                best, best_key = n, key
+        path: deque[tuple[Action, int]] = deque()
+        n = best
+        while n is not None and n != start:
+            p, a = parent[n]
+            path.appendleft((a, n))
+            n = p
+        return best, path
 
     def _fits(self, needed: int) -> bool:
         """Can `needed` more actions be taken this life without exhausting a known budget?"""
@@ -413,15 +499,19 @@ class ExplorerAgent:
         otherwise restarting just thrashes (cached per life)."""
         if self._restart_checked_life != (self.resets, self.score):
             self._restart_checked_life = (self.resets, self.score)
-            path = self._bfs(self.start_node, promising_only=True) or self._bfs(self.start_node, promising_only=False)
-            self._restart_ok = bool(path) and len(path) + 1 < (self.budget or 0)
+            tgt, path = self._choose_frontier(self.start_node, promising_only=True)
+            if tgt is None:
+                tgt, path = self._choose_frontier(self.start_node, promising_only=False)
+            self._restart_ok = tgt is not None and len(path) + 1 < (self.budget or 0)
         return self._restart_ok
 
-    def _restart(self) -> Action:
-        """Frontier out of reach in the remaining budget: RESET now instead of dying later."""
+    def _restart(self, keep_plan: bool = False) -> Action:
+        """RESET (frontier out of budget reach, or a RESET step of the current plan)."""
         self.pending = None
         self.cur_node = -1
-        self.plan.clear()
+        if not keep_plan:
+            self.plan.clear()
+            self.plan_expect = None
         return _RESET
 
     def _promising(self, act: Action, node: int) -> bool:
@@ -444,23 +534,3 @@ class ExplorerAgent:
             return self.last_act
         g = self.raws[self.node_raw[node]]
         return max(enumerate(lst), key=lambda t: (self._rate(t[1], g), -t[0]))[1]
-
-    def _bfs(self, start: int, promising_only: bool) -> deque[tuple[Action, int]]:
-        parent: dict[int, tuple[int, Action]] = {}
-        seen = {start}
-        q = deque([start])
-        while q:
-            n = q.popleft()
-            if n != start and self.untried[n] and (not promising_only or self._node_promising(n)):
-                path: list[tuple[Action, int]] = []
-                while n != start:
-                    p, a = parent[n]
-                    path.append((a, n))
-                    n = p
-                return deque(reversed(path))
-            for a, d in self.edges[n].items():
-                if d >= 0 and d != n and d not in seen:
-                    seen.add(d)
-                    parent[d] = (n, a)
-                    q.append(d)
-        return deque()
