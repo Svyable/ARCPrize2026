@@ -94,3 +94,10 @@ def test_win_ends_run():
     frame = {"frame": [grid], "state": "WIN", "score": 3}
     agent.choose_action([], frame)
     assert agent.is_done([], frame)
+
+
+def test_big_board_with_many_decoys_is_solved_quickly():
+    from arcagent.mock_big import Big
+
+    res = play(Big(njunk=150), ExplorerAgent(max_actions=500))
+    assert res["state"] == "WIN" and res["actions"] <= 40

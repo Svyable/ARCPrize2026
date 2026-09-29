@@ -50,7 +50,7 @@ def components(grid: np.ndarray, skip_color: int | None = None) -> list[Componen
 
 
 def click_candidates(
-    grid: np.ndarray, max_components: int = 48, grid_points: int = 4
+    grid: np.ndarray, max_components: int = 256, grid_points: int = 4
 ) -> list[tuple[int, int]]:
     """Ordered (x, y) click targets. Objects first (rare colours, then small size:
     interactive pieces tend to be small and uncommon), then a coarse lattice as a

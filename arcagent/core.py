@@ -63,10 +63,11 @@ class ExplorerAgent:
         self,
         seed: int = 0,
         max_actions: int = 20000,
-        max_components: int = 48,
+        max_components: int = 256,
         grid_points: int = 4,
         volatile_min_transitions: int = 6,
         volatile_threshold: float = 0.85,
+        min_rate: float = 0.2,
     ) -> None:
         self.rng = random.Random(seed)
         self.max_actions = max_actions
@@ -74,6 +75,7 @@ class ExplorerAgent:
         self.grid_points = grid_points
         self.vmin = volatile_min_transitions
         self.vthr = volatile_threshold
+        self.min_rate = min_rate
         self.actions_taken = 0
         self.score = 0
         self.won = False
@@ -315,10 +317,15 @@ class ExplorerAgent:
     # ---- action selection -----------------------------------------------------
     def _select(self) -> Action:
         node = self.cur_node
-        if self.untried[node]:
-            return self._commit(node, self._best_untried(node))
+        best = self._best_untried(node) if self.untried[node] else None
+        if best is not None and self._promising(best, node):
+            return self._commit(node, best)
         if not self.plan:
-            self.plan = self._bfs(node)
+            self.plan = self._bfs(node, promising_only=True)
+        if not self.plan and best is not None:
+            return self._commit(node, best)  # nothing promising anywhere: probe here
+        if not self.plan:
+            self.plan = self._bfs(node, promising_only=False)
         if self.plan:
             act, expect = self.plan.popleft()
             self.plan_expect = expect
@@ -331,6 +338,14 @@ class ExplorerAgent:
         known = list(self.edges[node]) or self._candidates(self.raws[self.cur_raw])
         return self._commit(node, self.rng.choice(known))
 
+    def _promising(self, act: Action, node: int) -> bool:
+        """Worth trying now: an under-sampled simple action or a kind that often changes the frame."""
+        forced, rate = self._rate(act, self.raws[self.node_raw[node]])
+        return forced or rate >= self.min_rate
+
+    def _node_promising(self, node: int) -> bool:
+        return any(self._promising(a, node) for a in self.untried[node])
+
     def _commit(self, node: int, act: Action) -> Action:
         self.pending = (self.cur_raw, act)
         if act in self.untried[node]:
@@ -342,13 +357,13 @@ class ExplorerAgent:
         g = self.raws[self.node_raw[node]]
         return max(enumerate(lst), key=lambda t: (self._rate(t[1], g), -t[0]))[1]
 
-    def _bfs(self, start: int) -> deque[tuple[Action, int]]:
+    def _bfs(self, start: int, promising_only: bool) -> deque[tuple[Action, int]]:
         parent: dict[int, tuple[int, Action]] = {}
         seen = {start}
         q = deque([start])
         while q:
             n = q.popleft()
-            if n != start and self.untried[n]:
+            if n != start and self.untried[n] and (not promising_only or self._node_promising(n)):
                 path: list[tuple[Action, int]] = []
                 while n != start:
                     p, a = parent[n]
