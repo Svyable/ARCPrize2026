@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import random
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -136,7 +136,11 @@ class ExplorerAgent:
     def _reset_level(self) -> None:
         self.raws: list[np.ndarray] = []
         self.raw_id: dict[bytes, int] = {}
-        self.log: list[tuple[int, Action, int]] = []  # (src_raw, action, dst_raw | DEAD)
+        self.log: list[tuple[int, Action, int, int]] = []  # (src_raw, action, dst_raw | DEAD, life_len)
+        self.life = 0  # actions since the last RESET / level start (fatal action included)
+        self.deaths: dict[tuple[int, Action], list[int]] = {}  # (node, action) -> life lengths at death
+        self.death_lens: list[int] = []
+        self.budget: int | None = None  # confirmed per-life action budget (deaths at equal length)
         self.nodes: dict[bytes, int] = {}
         self.node_raw: list[int] = []
         self.edges: list[dict[Action, int]] = []
@@ -157,6 +161,10 @@ class ExplorerAgent:
     def _emit(self, act: Action, reason: str) -> Move:
         self.actions_taken += 1
         aid, x, y = act
+        if aid == RESET_ID:
+            self.life = 0
+        else:
+            self.life += 1
         if aid == CLICK_ID:
             return Move(aid, x, y, reason)
         return Move(aid, reason=reason)
@@ -210,7 +218,7 @@ class ExplorerAgent:
         if self.pending is not None:
             src_raw, act = self.pending
             self.pending = None
-            self.log.append((src_raw, act, rid))
+            self.log.append((src_raw, act, rid, self.life))
             changed = not np.array_equal(self._masked(self.raws[src_raw]), self._masked(grid))
             st = self.stats.setdefault(self._kind(act, self.raws[src_raw]), [0, 0])
             st[0] += int(changed)
@@ -237,12 +245,39 @@ class ExplorerAgent:
             return
         src_raw, act = self.pending
         self.pending = None
-        self.log.append((src_raw, act, DEAD))
-        self._add_edge(self.cur_node, act, DEAD)
+        self.log.append((src_raw, act, DEAD, self.life))
+        self._register_death(self.cur_node, act, self.life)
         self.plan.clear()
         self.plan_expect = None
         # after RESET the frame is the level start; re-anchor on the next observation
         self.cur_node = -1
+
+    # A death is either the action's fault (hazard) or the life running out (step/energy
+    # budget, which the frame-only node key cannot see). Budget deaths cluster at one life
+    # length, so once some length repeats it is taken as the budget and deaths at exactly
+    # that length stop counting against their edge. Every other death blocks its edge.
+    def _register_death(self, node: int, act: Action, life: int) -> None:
+        self.deaths.setdefault((node, act), []).append(life)
+        self.death_lens.append(life)
+        length, count = max(Counter(self.death_lens).items(), key=lambda kv: (kv[1], kv[0]))
+        self.budget = length if count >= 2 else None
+        self._reprune()
+
+    def _blocked(self, node: int, act: Action) -> bool:
+        lens = self.deaths.get((node, act))
+        return bool(lens) and (self.budget is None or any(l != self.budget for l in lens))
+
+    def _reprune(self) -> None:
+        for (node, act) in self.deaths:
+            if self._blocked(node, act):
+                self.edges[node][act] = DEAD
+                if act in self.untried[node]:
+                    self.untried[node].remove(act)
+            else:  # budget death: the action itself is innocent, keep it retryable
+                if self.edges[node].get(act) == DEAD:
+                    del self.edges[node][act]
+                if act not in self.untried[node] and act not in self.edges[node]:
+                    self.untried[node].append(act)
 
     def _add_edge(self, src: int, act: Action, dst: int) -> None:
         self.edges[src][act] = dst
@@ -254,8 +289,13 @@ class ExplorerAgent:
     def _rebuild(self) -> None:
         self.nodes, self.node_raw, self.edges, self.untried = {}, [], [], []
         node_of_raw = [self._node(i) for i in range(len(self.raws))]
-        for src, act, dst in self.log:
-            self._add_edge(node_of_raw[src], act, DEAD if dst == DEAD else node_of_raw[dst])
+        self.deaths = {}
+        for src, act, dst, life in self.log:
+            if dst == DEAD:
+                self.deaths.setdefault((node_of_raw[src], act), []).append(life)
+            else:
+                self._add_edge(node_of_raw[src], act, node_of_raw[dst])
+        self._reprune()
         self.cur_node = node_of_raw[self.cur_raw]
         self.start_node = node_of_raw[0]
         self.plan.clear()
@@ -319,13 +359,15 @@ class ExplorerAgent:
         node = self.cur_node
         best = self._best_untried(node) if self.untried[node] else None
         if best is not None and self._promising(best, node):
-            return self._commit(node, best)
+            return self._commit(node, best) if self._fits(1) else self._restart()
         if not self.plan:
             self.plan = self._bfs(node, promising_only=True)
         if not self.plan and best is not None:
             return self._commit(node, best)  # nothing promising anywhere: probe here
         if not self.plan:
             self.plan = self._bfs(node, promising_only=False)
+        if self.plan and not self._fits(len(self.plan) + 1):
+            return self._restart()
         if self.plan:
             act, expect = self.plan.popleft()
             self.plan_expect = expect
@@ -337,6 +379,18 @@ class ExplorerAgent:
             return _RESET
         known = list(self.edges[node]) or self._candidates(self.raws[self.cur_raw])
         return self._commit(node, self.rng.choice(known))
+
+    def _fits(self, needed: int) -> bool:
+        """Can `needed` more actions be taken this life without exhausting a known budget?"""
+        b = self.budget
+        return b is None or self.life == 0 or self.life >= b or self.life + needed < b
+
+    def _restart(self) -> Action:
+        """Unreachable frontier within the remaining budget: RESET now instead of dying later."""
+        self.pending = None
+        self.cur_node = -1
+        self.plan.clear()
+        return _RESET
 
     def _promising(self, act: Action, node: int) -> bool:
         """Worth trying now: an under-sampled simple action or a kind that often changes the frame."""
