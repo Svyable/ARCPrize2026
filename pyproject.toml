@@ -1,0 +1,15 @@
+[project]
+name = "arcagent"
+version = "0.1.0"
+description = "Graph-exploration agent for ARC-AGI-3"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["arcagent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
