@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any
@@ -68,6 +69,9 @@ class ExplorerAgent:
         volatile_min_transitions: int = 6,
         volatile_threshold: float = 0.85,
         min_rate: float = 0.2,
+        momentum: bool = True,
+        novelty_rate: bool = True,
+        max_seconds: float | None = None,
     ) -> None:
         self.rng = random.Random(seed)
         self.max_actions = max_actions
@@ -76,6 +80,9 @@ class ExplorerAgent:
         self.vmin = volatile_min_transitions
         self.vthr = volatile_threshold
         self.min_rate = min_rate
+        self.momentum = momentum
+        self.novelty_rate = novelty_rate
+        self.deadline = None if max_seconds is None else time.monotonic() + max_seconds
         self.actions_taken = 0
         self.score = 0
         self.won = False
@@ -86,6 +93,8 @@ class ExplorerAgent:
     # ---- framework-facing API -------------------------------------------------
     def is_done(self, frames: Any, latest_frame: Any) -> bool:
         if self.won or self.actions_taken >= self.max_actions:
+            return True
+        if self.deadline is not None and time.monotonic() > self.deadline:
             return True
         state = latest_frame.get("state") if isinstance(latest_frame, dict) else getattr(latest_frame, "state", None)
         return _state_name(state) == "WIN"
@@ -137,6 +146,10 @@ class ExplorerAgent:
         self.raws: list[np.ndarray] = []
         self.raw_id: dict[bytes, int] = {}
         self.log: list[tuple[int, Action, int, int]] = []  # (src_raw, action, dst_raw | DEAD, life_len)
+        self.last_act: Action | None = None  # last action if it changed the state, else None
+        self.resets = 0  # RESETs issued this level
+        self._restart_checked_life: tuple[int, int] | None = None
+        self._restart_ok = False
         self.life = 0  # actions since the last RESET / level start (fatal action included)
         self.deaths: dict[tuple[int, Action], list[int]] = {}  # (node, action) -> life lengths at death
         self.death_lens: list[int] = []
@@ -162,7 +175,9 @@ class ExplorerAgent:
         self.actions_taken += 1
         aid, x, y = act
         if aid == RESET_ID:
+            self.resets += 1
             self.life = 0
+            self.last_act = None
         else:
             self.life += 1
         if aid == CLICK_ID:
@@ -220,9 +235,10 @@ class ExplorerAgent:
             self.pending = None
             self.log.append((src_raw, act, rid, self.life))
             changed = not np.array_equal(self._masked(self.raws[src_raw]), self._masked(grid))
+            n_nodes = len(self.edges)
             st = self.stats.setdefault(self._kind(act, self.raws[src_raw]), [0, 0])
-            st[0] += int(changed)
             st[1] += 1
+            self.last_act = act if changed else None
             self.cur_raw = rid
             rebuilt = self._update_volatility(self.raws[src_raw], grid, act)
             if rebuilt:
@@ -231,6 +247,8 @@ class ExplorerAgent:
                 src_node = self.cur_node
                 self.cur_node = self._node(rid)
                 self._add_edge(src_node, act, self.cur_node)
+            new_node = len(self.edges) > n_nodes
+            st[0] += int(new_node if self.novelty_rate else changed)
         else:
             self.cur_raw = rid
             self.cur_node = self._node(rid)
@@ -254,18 +272,21 @@ class ExplorerAgent:
 
     # A death is either the action's fault (hazard) or the life running out (step/energy
     # budget, which the frame-only node key cannot see). Budget deaths cluster at one life
-    # length, so once some length repeats it is taken as the budget and deaths at exactly
+    # length, so once some length repeats 3x it is taken as the budget and deaths at exactly
     # that length stop counting against their edge. Every other death blocks its edge.
     def _register_death(self, node: int, act: Action, life: int) -> None:
         self.deaths.setdefault((node, act), []).append(life)
         self.death_lens.append(life)
         length, count = max(Counter(self.death_lens).items(), key=lambda kv: (kv[1], kv[0]))
-        self.budget = length if count >= 2 else None
+        self.budget = length if count >= 3 else None
         self._reprune()
 
     def _blocked(self, node: int, act: Action) -> bool:
         lens = self.deaths.get((node, act))
-        return bool(lens) and (self.budget is None or any(l != self.budget for l in lens))
+        if not lens:
+            return False
+        # An edge that keeps killing is a hazard even if a coincidental "budget" excuses it.
+        return len(lens) >= 3 or self.budget is None or any(l != self.budget for l in lens)
 
     def _reprune(self) -> None:
         for (node, act) in self.deaths:
@@ -359,14 +380,16 @@ class ExplorerAgent:
         node = self.cur_node
         best = self._best_untried(node) if self.untried[node] else None
         if best is not None and self._promising(best, node):
-            return self._commit(node, best) if self._fits(1) else self._restart()
+            if self._fits(1) or not self._restart_useful():
+                return self._commit(node, best)
+            return self._restart()
         if not self.plan:
             self.plan = self._bfs(node, promising_only=True)
         if not self.plan and best is not None:
             return self._commit(node, best)  # nothing promising anywhere: probe here
         if not self.plan:
             self.plan = self._bfs(node, promising_only=False)
-        if self.plan and not self._fits(len(self.plan) + 1):
+        if self.plan and not self._fits(len(self.plan) + 1) and self._restart_useful():
             return self._restart()
         if self.plan:
             act, expect = self.plan.popleft()
@@ -385,8 +408,17 @@ class ExplorerAgent:
         b = self.budget
         return b is None or self.life == 0 or self.life >= b or self.life + needed < b
 
+    def _restart_useful(self) -> bool:
+        """A RESET only helps if a fresh life can reach a frontier inside the budget;
+        otherwise restarting just thrashes (cached per life)."""
+        if self._restart_checked_life != (self.resets, self.score):
+            self._restart_checked_life = (self.resets, self.score)
+            path = self._bfs(self.start_node, promising_only=True) or self._bfs(self.start_node, promising_only=False)
+            self._restart_ok = bool(path) and len(path) + 1 < (self.budget or 0)
+        return self._restart_ok
+
     def _restart(self) -> Action:
-        """Unreachable frontier within the remaining budget: RESET now instead of dying later."""
+        """Frontier out of reach in the remaining budget: RESET now instead of dying later."""
         self.pending = None
         self.cur_node = -1
         self.plan.clear()
@@ -408,6 +440,8 @@ class ExplorerAgent:
 
     def _best_untried(self, node: int) -> Action:
         lst = self.untried[node]
+        if self.momentum and self.last_act is not None and self.last_act in lst:
+            return self.last_act
         g = self.raws[self.node_raw[node]]
         return max(enumerate(lst), key=lambda t: (self._rate(t[1], g), -t[0]))[1]
 

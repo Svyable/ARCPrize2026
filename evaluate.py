@@ -16,7 +16,7 @@ from concurrent.futures import ProcessPoolExecutor
 ENV_DIR = "environment_files"
 
 
-def play_game(gid: str, agent_name: str, max_actions: int, seed: int) -> dict:
+def play_game(gid: str, agent_name: str, max_actions: int, seed: int, opts: dict | None = None) -> dict:
     from arc_agi import Arcade, OperationMode
     from arcengine import GameAction, GameState
 
@@ -27,7 +27,7 @@ def play_game(gid: str, agent_name: str, max_actions: int, seed: int) -> dict:
     arc = Arcade(operation_mode=OperationMode.OFFLINE, environments_dir=ENV_DIR, logger=logging.getLogger("q"))
     info = next(e for e in arc.get_environments() if e.game_id.startswith(gid))
     env = arc.make(gid)
-    agent = ExplorerAgent(seed=seed, max_actions=max_actions) if agent_name == "explorer" else None
+    agent = ExplorerAgent(seed=seed, max_actions=max_actions, **(opts or {})) if agent_name == "explorer" else None
     rng = random.Random(seed)
     frame = env.observation_space
     level_actions: dict[int, int] = {}
@@ -62,6 +62,7 @@ def play_game(gid: str, agent_name: str, max_actions: int, seed: int) -> dict:
         scores.append(min((b / a) ** 2, 1.15) * 100 if done and a else 0.0)
         weights.append(i + 1)
     score = sum(s * w for s, w in zip(scores, weights)) / sum(weights)
+    score = min(score, sum(w for s, w in zip(scores, weights) if s > 0) / sum(weights) * 100)  # toolkit's cap
     return {
         "game": gid, "state": frame.state.name, "levels": f"{frame.levels_completed}/{len(base)}",
         "actions": n, "resets": resets, "score": round(score, 2), "secs": round(time.time() - t0, 1),
@@ -76,19 +77,24 @@ def main() -> None:
     ap.add_argument("--agent", default="explorer")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--opts", default="", help="ExplorerAgent kwargs, e.g. momentum=0,min_rate=0.3")
+    ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
     from pathlib import Path
 
     gids = a.games.split(",") if a.games else sorted(p.name for p in Path(ENV_DIR).iterdir() if p.is_dir())
     with ProcessPoolExecutor(a.workers) as ex:
-        futs = [ex.submit(play_game, g, a.agent, a.max_actions, a.seed) for g in gids]
+        opts = {k: (float(v) if "." in v else int(v)) for k, v in (kv.split("=") for kv in a.opts.split(",") if kv)}
+        opts = {k: bool(v) if k in ("momentum", "novelty_rate") else v for k, v in opts.items()}
+        futs = [ex.submit(play_game, g, a.agent, a.max_actions, a.seed, opts) for g in gids]
         rows = [f.result() for f in futs]
     tot = 0.0
     for r in rows:
         tot += r["score"]
-        print(f"{r['game']:5s} {r['state']:12s} levels={r['levels']:5s} actions={r['actions']:5d} resets={r['resets']:4d} "
+        if not a.quiet: print(f"{r['game']:5s} {r['state']:12s} levels={r['levels']:5s} actions={r['actions']:5d} resets={r['resets']:4d} "
               f"score={r['score']:6.2f} {r['secs']:5.1f}s err={r['errors']} {r['err'] or ''}")
-    print(f"MEAN SCORE over {len(rows)} games: {tot / len(rows):.2f}")
+    lv = sum(int(r["levels"].split("/")[0]) for r in rows)
+    print(f"MEAN SCORE over {len(rows)} games: {tot / len(rows):.2f}   levels solved: {lv}   opts={a.opts or 'default'}")
 
 
 if __name__ == "__main__":
