@@ -1,11 +1,12 @@
 [project]
 name = "arcagent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Graph-exploration agent for ARC-AGI-3"
 requires-python = ">=3.10"
 dependencies = ["numpy"]
 
 [project.optional-dependencies]
+arc = ["arc-agi", "arcengine"]  # need Python >= 3.12
 dev = ["pytest"]
 
 [tool.setuptools]
