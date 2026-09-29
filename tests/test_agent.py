@@ -101,3 +101,30 @@ def test_big_board_with_many_decoys_is_solved_quickly():
 
     res = play(Big(njunk=150), ExplorerAgent(max_actions=500))
     assert res["state"] == "WIN" and res["actions"] <= 40
+
+
+# ---- per-life step budget -----------------------------------------------------
+def test_budget_deaths_do_not_permanently_block_edges():
+    from arcagent.mock_env import BudgetMaze
+
+    res = play(BudgetMaze(budget=30), ExplorerAgent(max_actions=4000))
+    assert res["state"] == "WIN"
+
+
+def test_coincidental_deaths_at_one_edge_do_not_fake_a_budget():
+    agent = ExplorerAgent()
+    agent._reset_level()
+    agent.edges, agent.untried = [{}], [[(1, -1, -1)]]
+    for _ in range(4):  # the same hazard edge kills at the same life length every time
+        agent._register_death(0, (1, -1, -1), 7)
+    assert agent.budget is None and agent._blocked(0, (1, -1, -1))
+
+
+def test_three_distinct_edges_dying_at_same_length_confirm_a_budget():
+    agent = ExplorerAgent()
+    agent._reset_level()
+    agent.edges = [{} for _ in range(3)]
+    agent.untried = [[(1, -1, -1)] for _ in range(3)]
+    for node in range(3):
+        agent._register_death(node, (1, -1, -1), 66)
+    assert agent.budget == 66 and not agent._blocked(0, (1, -1, -1))

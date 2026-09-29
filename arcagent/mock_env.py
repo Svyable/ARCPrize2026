@@ -187,3 +187,18 @@ class ClickGame(MockGame):
         for (tx, ty), done in self.tiles.items():
             g[ty : ty + 2, tx : tx + 2] = 3 if done else 2
         return g
+
+
+class BudgetMaze(MazeGame):
+    """MazeGame where every life lasts only `budget` actions (GAME_OVER on the budget-th),
+    like the step/energy limits in the real games. The killing action is innocent."""
+
+    def __init__(self, budget: int = 30) -> None:
+        super().__init__()
+        self.budget = budget
+
+    def _apply(self, a, x, y):
+        out = super()._apply(a, x, y)
+        if out is None and self.steps_in_level >= self.budget:
+            return "dead"
+        return out

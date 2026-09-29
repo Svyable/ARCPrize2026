@@ -166,6 +166,7 @@ class ExplorerAgent:
         self.life = 0  # actions since the last RESET / level start (fatal action included)
         self.deaths: dict[tuple[int, Action], list[int]] = {}  # (node, action) -> life lengths at death
         self.death_lens: list[int] = []
+        self.retried: set[tuple[int, Action]] = set()
         self.budget: int | None = None  # confirmed per-life action budget (deaths at equal length)
         self.nodes: dict[bytes, int] = {}
         self.node_raw: list[int] = []
@@ -293,13 +294,16 @@ class ExplorerAgent:
         self.deaths.setdefault((node, act), []).append(life)
         self.death_lens.append(life)
         length, count = max(Counter(self.death_lens).items(), key=lambda kv: (kv[1], kv[0]))
-        self.budget = length if count >= 3 else None
+        edges_at_len = {e for e, lens in self.deaths.items() if length in lens}
+        self.budget = length if count >= 3 and len(edges_at_len) >= 3 else None
         self._reprune()
 
     def _blocked(self, node: int, act: Action) -> bool:
         lens = self.deaths.get((node, act))
         if not lens:
             return False
+        if (node, act) in self.retried and len(lens) < 2:
+            return False  # one more attempt granted when the graph ran dry
         # An edge that keeps killing is a hazard even if a coincidental "budget" excuses it.
         return len(lens) >= 3 or self.budget is None or any(l != self.budget for l in lens)
 
@@ -422,7 +426,16 @@ class ExplorerAgent:
         return self._fits(len(self.plan) + 1)
 
     def _fully_explored(self, node: int) -> Action:
-        """Everything known is exhausted: restart the level, else poke randomly."""
+        """Everything known is exhausted. First give blocked death edges one more chance
+        (longest-life deaths first: those are the likeliest budget deaths and may be
+        blocking the only way forward); then restart the level; then poke randomly."""
+        suspects = [(max(lens), k) for k, lens in self.deaths.items()
+                    if k not in self.retried and self._blocked(*k)]
+        if suspects:
+            _, key = max(suspects)
+            self.retried.add(key)
+            self._reprune()
+            return self._select()
         if node != self.start_node:
             return self._restart()
         known = list(self.edges[node]) or self._candidates(self.raws[self.cur_raw])
